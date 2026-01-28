@@ -331,13 +331,15 @@ class SECDelistingScraperOptimized:
     """Optimized SEC scraper with maximum free market cap coverage."""
     
     def __init__(self, user_agent: str = "Research Bot research@example.com", 
-                 fmp_api_key: Optional[str] = None):
+                 fmp_api_key: Optional[str] = None,
+                 target_exchanges: Optional[List[str]] = None):
         """
         Initialize scraper.
         
         Args:
             user_agent: User agent string (SEC requirement)
             fmp_api_key: Optional FMP API key for better market cap data
+            target_exchanges: List of exchanges to filter (default: NYSE, NASDAQ, AMEX)
         """
         self.base_url = "https://data.sec.gov"
         self.headers = {
@@ -348,6 +350,75 @@ class SECDelistingScraperOptimized:
         self.session.headers.update(self.headers)
         self.market_cap_fetcher = OptimizedMarketCapFetcher(fmp_api_key)
         
+        # Default to NYSE, NASDAQ, and AMEX only
+        self.target_exchanges = target_exchanges or ['NYSE', 'NASDAQ', 'AMEX']
+        
+        # Load exchange mapping from ticker
+        self.ticker_to_exchange = self._build_ticker_exchange_mapping()
+    
+    def _build_ticker_exchange_mapping(self) -> Dict[str, str]:
+        """
+        Build a mapping of tickers to their primary exchange.
+        Uses Yahoo Finance info to determine exchange.
+        """
+        logger.info("Building ticker-to-exchange mapping...")
+        # For now, return empty dict - will be populated as we check tickers
+        return {}
+    
+    def _get_ticker_exchange(self, ticker: str) -> Optional[str]:
+        """
+        Get the exchange for a ticker using Yahoo Finance.
+        
+        Args:
+            ticker: Stock ticker symbol
+            
+        Returns:
+            Exchange name ('NYSE', 'NASDAQ', 'AMEX') or None
+        """
+        # Check cache first
+        if ticker in self.ticker_to_exchange:
+            return self.ticker_to_exchange[ticker]
+        
+        try:
+            import yfinance as yf
+            stock = yf.Ticker(ticker)
+            info = stock.info
+            
+            # Get exchange from Yahoo Finance
+            exchange_raw = info.get('exchange', '').upper()
+            
+            # Map Yahoo Finance exchange codes to our target exchanges
+            exchange_mapping = {
+                'NYQ': 'NYSE',          # NYSE
+                'NYSE': 'NYSE',
+                'NMS': 'NASDAQ',        # NASDAQ
+                'NASDAQ': 'NASDAQ',
+                'NGM': 'NASDAQ',        # NASDAQ Global Market
+                'NAS': 'NASDAQ',
+                'ASE': 'AMEX',          # American Stock Exchange
+                'AMEX': 'AMEX',
+                'PCX': 'NYSE ARCA',     # NYSE Arca
+                'NYE': 'NYSE',
+            }
+            
+            exchange = exchange_mapping.get(exchange_raw)
+            
+            # Cache the result
+            if exchange:
+                self.ticker_to_exchange[ticker] = exchange
+                return exchange
+            
+            # If no exchange found, try to infer from ticker suffix
+            if '.' in ticker:
+                # Some tickers have exchange suffixes
+                return None
+            
+            return None
+            
+        except Exception as e:
+            logger.debug(f"Could not determine exchange for {ticker}: {e}")
+            return None
+    
     def get_company_tickers(self) -> Dict[str, Dict]:
         """Get mapping of CIK to ticker symbols from SEC."""
         logger.info("Fetching company ticker mappings from SEC...")
@@ -426,7 +497,8 @@ class SECDelistingScraperOptimized:
         """
         logger.info("="*70)
         logger.info(f"Searching Form 25 filings: {start_date} to {end_date}")
-        logger.info(f"Target: Market cap < ${max_market_cap/1e9:.1f}B")
+        logger.info(f"Target exchanges: {', '.join(self.target_exchanges)}")
+        logger.info(f"Market cap filter: < ${max_market_cap/1e9:.1f}B")
         logger.info("="*70)
         
         # Get all company tickers
@@ -435,6 +507,8 @@ class SECDelistingScraperOptimized:
         all_filings = []
         filings_with_market_cap = []
         processed = 0
+        skipped_exchange = 0
+        skipped_no_exchange = 0
         total = len(cik_to_ticker)
         
         start_dt = datetime.strptime(start_date, '%Y-%m-%d')
@@ -451,7 +525,8 @@ class SECDelistingScraperOptimized:
                 logger.info(
                     f"Progress: {processed:,}/{total:,} ({elapsed_pct:.1f}%) | "
                     f"Found: {len(all_filings)} filings, "
-                    f"{len(filings_with_market_cap)} confirmed small-caps"
+                    f"{len(filings_with_market_cap)} confirmed small-caps, "
+                    f"Skipped: {skipped_exchange} (wrong exchange)"
                 )
             
             # Get submissions
@@ -479,11 +554,28 @@ class SECDelistingScraperOptimized:
                 if not (start_dt <= filing_dt <= end_dt):
                     continue
                 
-                # Found a Form 25 filing in our date range!
+                # Check exchange using Yahoo Finance (lighter weight)
+                ticker = company_info['ticker']
+                exchange = self._get_ticker_exchange(ticker)
+                
+                # Filter by target exchanges
+                if exchange and exchange not in self.target_exchanges:
+                    skipped_exchange += 1
+                    logger.debug(f"Skipping {ticker} - Exchange: {exchange}")
+                    continue
+                
+                # If we couldn't determine exchange, skip it to be safe
+                if not exchange:
+                    skipped_no_exchange += 1
+                    logger.debug(f"Skipping {ticker} - Could not determine exchange")
+                    continue
+                
+                # Found a Form 25 filing for target exchange!
                 filing_info = {
-                    'ticker': company_info['ticker'],
+                    'ticker': ticker,
                     'company_name': company_info['title'],
                     'cik': cik,
+                    'exchange': exchange,
                     'form_type': form_type,
                     'filing_date': filing_date,
                     'accession_number': recent_filings['accessionNumber'][i],
@@ -494,7 +586,7 @@ class SECDelistingScraperOptimized:
                 
                 # Try to get market cap using all available methods
                 market_cap, source = self.market_cap_fetcher.get_market_cap(
-                    company_info['ticker'],
+                    ticker,
                     filing_date,
                     company_info['title']
                 )
@@ -514,6 +606,8 @@ class SECDelistingScraperOptimized:
             time.sleep(0.11)
         
         logger.info(f"\n✓ Completed processing {total:,} companies")
+        logger.info(f"✓ Filtered out {skipped_exchange:,} delistings from other exchanges")
+        logger.info(f"✓ Skipped {skipped_no_exchange:,} with unknown exchange")
         
         return all_filings, filings_with_market_cap
     
@@ -547,6 +641,13 @@ class SECDelistingScraperOptimized:
         df_symbols = df_unique[['ticker']].sort_values('ticker')
         df_symbols.to_csv(symbols_file, index=False)
         logger.info(f"✓ Saved {len(df_symbols):,} symbols to {symbols_file}")
+        
+        # Print exchange breakdown
+        if 'exchange' in df_unique.columns:
+            print("\nExchange Breakdown:")
+            exchange_counts = df_unique['exchange'].value_counts()
+            for exchange, count in exchange_counts.items():
+                print(f"  {exchange:15} {count:,} stocks")
     
     def print_summary(self, all_filings: List[Dict], small_cap_filings: List[Dict], max_market_cap: float):
         """Print summary statistics."""
@@ -565,6 +666,7 @@ class SECDelistingScraperOptimized:
         print("FINAL RESULTS SUMMARY")
         print("="*70)
         print(f"Total Form 25 delistings found:      {total:,}")
+        print(f"Exchanges: {', '.join(self.target_exchanges)}")
         print(f"\nMarket Cap Classification:")
         print(f"  Small-caps (< ${max_market_cap/1e9:.1f}B):        {confirmed_small_caps:,} ({(confirmed_small_caps/total)*100:.1f}%)")
         print(f"  Large-caps (≥ ${max_market_cap/1e9:.1f}B):        {confirmed_large_caps:,} ({(confirmed_large_caps/total)*100:.1f}%)")
@@ -586,7 +688,7 @@ def main():
     print("SEC FORM 25 DELISTING SCRAPER - OPTIMIZED FOR MAXIMUM COVERAGE")
     print("="*70)
     
-    # ========== CONFIGURATION ==========
+    # ========== CONFIGURATION =========
     
     # Date range
     START_DATE = "2015-01-01"
@@ -594,6 +696,9 @@ def main():
     
     # Market cap threshold
     MAX_MARKET_CAP = 2_000_000_000  # $2 billion
+    
+    # Target exchanges (NYSE, NASDAQ, AMEX only)
+    TARGET_EXCHANGES = ['NYSE', 'NASDAQ', 'AMEX', 'NYSE AMERICAN']
     
     # Output files - will be created in ./outputs/ folder next to script
     import os
@@ -610,29 +715,32 @@ def main():
     # OPTIONAL: Free FMP API key for 20-30% better coverage
     # Sign up at: https://site.financialmodelingprep.com/developer/docs/
     # Free tier: 250 API calls per day
-    FMP_API_KEY = "L8vt17Bag4lxpi0QhHrXPDo4fhp0XypI"
+    FMP_API_KEY = None  # Set to None - not useful for delisted stocks on free tier
     
     # ===================================
     
     print(f"\nConfiguration:")
     print(f"  Date range: {START_DATE} to {END_DATE}")
+    print(f"  Exchanges: {', '.join(TARGET_EXCHANGES)}")
     print(f"  Market cap filter: < ${MAX_MARKET_CAP/1e9:.1f}B")
     print(f"  Output directory: {output_dir}")
     print(f"  FMP API: {'✓ Enabled' if FMP_API_KEY else '✗ Not configured'}")
-    print(f"  Expected runtime: 15-25 minutes")
+    print(f"  Expected runtime: 20-30 minutes (longer due to exchange filtering)")
     print("="*70)
     
     # Confirm before starting
     print("\nThis will:")
     print("  1. Fetch ALL Form 25 filings from SEC (2015-2024)")
-    print("  2. Try to get market cap for each using 3 free methods")
-    print("  3. Filter to stocks < $2B market cap")
-    print("  4. Save results to CSV")
+    print("  2. Filter to NYSE, NASDAQ, and AMEX only")
+    print("  3. Try to get market cap for each using free methods")
+    print("  4. Filter to stocks < $2B market cap")
+    print("  5. Save results to CSV")
     
     # Initialize scraper
     scraper = SECDelistingScraperOptimized(
         user_agent=USER_AGENT,
-        fmp_api_key=FMP_API_KEY
+        fmp_api_key=FMP_API_KEY,
+        target_exchanges=TARGET_EXCHANGES
     )
     
     # Find all filings and filter by market cap
