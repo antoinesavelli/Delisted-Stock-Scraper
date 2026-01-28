@@ -688,7 +688,7 @@ def main():
     print("SEC FORM 25 DELISTING SCRAPER - OPTIMIZED FOR MAXIMUM COVERAGE")
     print("="*70)
     
-    # ========== CONFIGURATION =========
+    # ========== CONFIGURATION ==========
     
     # Date range
     START_DATE = "2015-01-01"
