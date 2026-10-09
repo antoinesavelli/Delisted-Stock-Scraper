@@ -710,7 +710,7 @@ def main():
     
     # IMPORTANT: Update with YOUR contact info (SEC requirement)
     # Format: Company/Product Name Contact_Email
-    USER_AGENT = "ResearchBot your-email@example.com"
+    USER_AGENT = "YourName your-email@example.com"  # replace with your own contact before running
     
     # OPTIONAL: Free FMP API key for 20-30% better coverage
     # Sign up at: https://site.financialmodelingprep.com/developer/docs/
